@@ -1,0 +1,4 @@
+!ghcc/
+!scripts/
+!*.py
+!requirements.txt

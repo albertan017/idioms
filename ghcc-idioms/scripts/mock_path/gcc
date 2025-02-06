@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+r"""A fake gcc implementation which records input/output files, and then calls real gcc.
+"""
+import argparse
+import os
+import subprocess
+import sys
+
+
+def filter_filenames(args):
+    return [arg for arg in args if arg.endswith('.c') or arg.endswith('.h')]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-o')
+    parser.add_argument('-c', action='store_true')
+    # Override the optimization level with -O0.
+    parser.add_argument('-O', nargs='?')
+    # Record the libraries used.
+    parser.add_argument('-l', action='append')
+    # Disable settings to platform-specific code; we only target our platform.
+    parser.add_argument('-mabi')  # ignored
+    parser.add_argument('-march')  # ignored
+    parser.add_argument('-mtune')  # ignored
+    # Swallow flags that are unnecessary for us.
+    parser.add_argument('-Wall', action='store_true')
+    parser.add_argument('-Werror', action='store_true')
+    parser.add_argument('-Wextra', action='store_true')
+    # Link time optimization would cause `-g` to be ignored on older versions of GCC.
+    parser.add_argument('-flto', action='store_true')  # ignored
+    parser.add_argument('-mlittle-endian', action='store_true')  # ignored
+    parser.add_argument('-mapcs', action='store_true')  # ignored
+    parser.add_argument('-mno-sched-prolog', action='store_true')  # ignored
+
+    args, unknown_args = parser.parse_known_args(sys.argv[1:])
+
+    # The `-ggdb[level]` flag would preserve macros for certain levels. This would cause problems with `pycparser`.
+    unknown_args = [arg for arg in unknown_args if not arg.startswith("-ggdb")]
+
+    # Remove the mock path from PATH to find the actual GCC.
+    cur_path = os.path.abspath(os.path.split(__file__)[0])
+    all_paths = [os.path.abspath(path) for path in os.environ["PATH"].split(":")]
+    env = {b"PATH": ':'.join(path for path in all_paths if path != cur_path).encode('utf-8')}
+
+    override_flags = os.environ.get("MOCK_GCC_OVERRIDE_FLAGS", "").split()
+
+    # Gather library names that the program is linked to.
+    # Note that this is only called if exception occurs, or GCC fails. This gets rid of libraries that are installed.
+    def write_libraries():
+        log_path = os.environ.get("MOCK_GCC_LIBRARY_LOG", "").strip()
+        if len(log_path) > 0 and args.l:
+            with open(log_path, "a") as f:
+                f.write('\n'.join(args.l) + '\n')
+
+    filenames = filter_filenames(unknown_args)
+    out_file = None
+    if args.o:
+        out_file = args.o
+    elif args.c:
+        for f in filenames:
+            if f.endswith('.c'):
+                out_file = os.path.splitext(f)[0] + ".o"
+    if out_file is None:
+        out_file = 'a.out'
+
+    known_args = []
+    if args.c:
+        known_args.append("-c")
+
+    try:
+        gcc = "gcc"  # "gcc-4.7"
+        
+        # for ADV obfuscator (compiling with c++)
+        if os.environ["COMPILER"] == "g++":
+            gcc = "g++" 
+            override_flags.append("--std=c++11")
+            override_flags.append("-fpermissive")
+
+        # for compiling with LLVM obfuscator
+        if os.environ["COMPILER"] == "clang":
+            gcc = "/build/bin/clang" # CHECK PATH
+        
+        print(f"override flags {override_flags}")
+        # When multiple -O options are specified, the last one takes precedence.
+        gcc_args = [gcc] + known_args + unknown_args + ["-o", out_file, "-g"] + override_flags
+
+        # Add linker options after files that use them.
+        gcc_args.extend([f"-l{lib}" for lib in (args.l or [])])
+        sys.stderr.write("Mock GCC: " + ' '.join(gcc_args) + "\n")
+        #print(f"Mock GCC: {' '.join(gcc_args)} \n")
+
+        # Redirecting to a pipe could prevent GCC producing colored output.
+        process = subprocess.Popen(gcc_args, stdout=sys.stdout, stderr=sys.stderr, env=env)
+        process.wait()
+        if process.returncode != 0:
+            write_libraries()
+            sys.stderr.write(f"Return code: {process.returncode}\n")
+            exit(process.returncode)
+    except Exception as e:
+        write_libraries()
+        sys.stderr.write(f"Mock GCC: Exception: {e}\n")
+        exit(2)
+
+
+if __name__ == "__main__":
+    main()
