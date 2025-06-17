@@ -17,11 +17,12 @@ from idioms.data.dataset import MatchedFunction
 
 def get_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("table", choices=[1, 2], type=int, help="The first or second table in the paper.")
     parser.add_argument("x_axis", choices=["model", "run", "metric"], help="x_axis in the output graphs")
     parser.add_argument("y_axis", choices=["model", "run", "metric"], help="y_axis in the output graph.")
     parser.add_argument("--cache", type=str, help="Stores the result of the state of the results directory.")
-    # parser.add_argument("--no-recompute-results", action="store_true")
     parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--baseline-dir", type=str, default="baselines", help="Where non-idioms results are stored. Only relevant for the second table.")
     parser.add_argument("--eval-partition", choices=["validation", "test"], default="test")
     parser.add_argument("--exebench-subpartition", choices=["both", "real", "synth"], default="real")
     parser.add_argument("--checkpoint-type", choices=["best", "last"], default="best")
@@ -29,7 +30,7 @@ def get_args():
     return parser.parse_args()
 
 MAX_COLUMN_WIDTH = None
-DECIMAL_PLACES = 2
+DECIMAL_PLACES = 1
 BEST_CHECKPOINT_LOCATION = "results/best_checkpoints.json"
 
 MODEL_NAMES = [
@@ -52,7 +53,24 @@ EXEBENCH_RUN_TYPES = [
     "parity-exebench-O0"
 ]
 
+TABLE_2_RUN_TYPES = [
+    "exebench-O0",
+    "O0",
+    "O1",
+    "O2",
+    "O3"
+]
+
+TABLE_2_MODELS = [
+    "codegemma-7b",
+    "llm4decompile-6.7b-v2",
+    "nova-6.7b-bcr"
+]
+
+OPT_CHECKPOINT = "checkpoint-13280"
+
 METRICS = [
+    "consistently_aligned",
     "perfectly_aligned",
     "perfectly_aligned_and_typechecks",
     "variable_name_accuracy",
@@ -60,6 +78,7 @@ METRICS = [
     "variable_udt_exact_matches",
     "variable_udt_composition_matches",
     "bleu",
+    "errors_during_evaluation"
 ]
 
 EXEBENCH_METRICS = [
@@ -227,6 +246,7 @@ def read_exebench_scores(run_results_dir: Path, eval_partition: str, exebench_su
         
 
 def main(args: argparse.Namespace):
+    causal_table = args.table == 1
     eval_partition: str = args.eval_partition
     exebench_subpartition: str = args.exebench_subpartition
     results_dir = Path(args.results_dir)
@@ -238,8 +258,10 @@ def main(args: argparse.Namespace):
         cache = cache.with_suffix(".pkl")
     assert results_dir.exists(), f"Results dir {results_dir} does not exist!"
     assert results_dir.is_dir(), f"Results dir {results_dir} is not a directory!"
-    # run_type_indices: dict[str, int] = {t: i for i, t in enumerate(RUN_TYPES)}
-    # recompute: bool = not args.no_recompute_results
+    baseline_dir = Path(args.baseline_dir)
+    if not causal_table: # this is the only scenario where it is used.
+        assert baseline_dir.exists(), f"Baseline dir {baseline_dir} does not exist!"
+        assert baseline_dir.is_dir()
     x_axis = args.x_axis
     y_axis = args.y_axis
 
@@ -247,46 +269,118 @@ def main(args: argparse.Namespace):
         with open(BEST_CHECKPOINT_LOCATION, "r") as fp:
             use_checkpoint: dict[str, str] = json.load(fp)
 
+    if causal_table:
+        run_types = RUN_TYPES
+        model_names = MODEL_NAMES
+        num_exebench = 2
+        axis_indices = {
+            "model": MODEL_NAMES,
+            "run": RUN_TYPES,
+            "metric": METRICS
+        }
+        exebench_axis_indices = {
+            "model": MODEL_NAMES,
+            "run": EXEBENCH_RUN_TYPES,
+            "metric": EXEBENCH_METRICS
+        }
+    else:
+        run_types = TABLE_2_RUN_TYPES
+        model_names = TABLE_2_MODELS
+        num_exebench = 1
+        axis_indices = {
+            "model": TABLE_2_MODELS,
+            "run": TABLE_2_RUN_TYPES,
+            "metric": METRICS
+        }
+        exebench_axis_indices = {
+            "model": TABLE_2_MODELS,
+            "run": EXEBENCH_RUN_TYPES[:1],
+            "metric": EXEBENCH_METRICS
+        }
+
     if cache is None or not cache.exists():
+        evaluator = FunctionEvaluator()
+
         # Default axes:
         # 1. model name
         # 2. run type (dataset/context type)
         # 3. metrics
-        evaluator = FunctionEvaluator()
+        results: list[list[None | dict]] = [[None] * len(run_types) for _ in range(len(model_names))]
+        exebench_results: list[list[None | dict]] = [[None] * num_exebench for _ in range(len(model_names))]
 
-        results: list[list[None | dict]] = [[None] * len(RUN_TYPES) for _ in range(len(MODEL_NAMES))]
-        exebench_results: list[list[None | dict]] = [[None] * 2 for _ in range(len(MODEL_NAMES))]
-
-        for (i, model_name), (j, run_type) in tqdm(itertools.product(enumerate(MODEL_NAMES), enumerate(RUN_TYPES)), total=len(MODEL_NAMES) * len(RUN_TYPES)):
-            run_name = f"{model_name}-{run_type}"
-            run_results_dir = results_dir / run_name
-            if not run_results_dir.exists():
-                continue
-
-            if use_best and (run_type != "exebench-O0" or "qwen" in model_name):
-                if run_name in use_checkpoint:
-                    run_results_dir = run_results_dir / use_checkpoint[run_name]
-                else:
+        if causal_table:
+            for (i, model_name), (j, run_type) in tqdm(itertools.product(enumerate(MODEL_NAMES), enumerate(RUN_TYPES)), total=len(MODEL_NAMES) * len(RUN_TYPES)):
+                run_name = f"{model_name}-{run_type}"
+                run_results_dir = results_dir / run_name
+                if not run_results_dir.exists():
                     continue
-            if "exebench-O0" in run_type:
-                run_results_dir = run_results_dir / "exebench-hf-O0-eval"
-            
-            try:
-                print(f"Using {run_results_dir}")
-                results[i][j] = read_results(run_results_dir, evaluator, eval_partition, exebench_subpartition if "exebench" in run_type else None)
-            except FileNotFoundError:
-                pass
 
-            if "exebench" in run_type:
+                if use_best and (run_type != "exebench-O0" or "qwen" in model_name):
+                    if run_name in use_checkpoint:
+                        run_results_dir = run_results_dir / use_checkpoint[run_name]
+                    else:
+                        continue
+                if "exebench-O0" in run_type:
+                    run_results_dir = run_results_dir / "exebench-hf-O0-eval"
+                
                 try:
-                    exebench_results[i][j] = read_exebench_scores(run_results_dir, eval_partition, exebench_subpartition)
-                except (FileNotFoundError, KeyError):
+                    print(f"Using {run_results_dir}")
+                    results[i][j] = read_results(run_results_dir, evaluator, eval_partition, exebench_subpartition if "exebench" in run_type else None)
+                except FileNotFoundError:
                     pass
 
-        metrics = []
+                if "exebench" in run_type:
+                    try:
+                        exebench_results[i][j] = read_exebench_scores(run_results_dir, eval_partition, exebench_subpartition)
+                    except (FileNotFoundError, KeyError):
+                        pass
+        else:
+            assert args.table == 2, f"Unsupported table id: {args.table}"
+
+            for (i, model_name), (j, run_type) in tqdm(itertools.product(enumerate(model_names), enumerate(run_types)), total=len(run_types) * len(model_names)):
+                print(f"Trial {model_name}/{run_type}")
+                # Locate the results
+                run_is_exebench = "exebench" in run_type
+                if model_name == "codegemma-7b":
+                    if run_is_exebench:
+                        run_name = "codegemma-7b-exebench-O0"
+                        run_results_dir = results_dir / run_name / "exebench-hf-O0-eval"
+                    else:
+                        run_name = f"opt-{run_type}-codegemma-7b-neighbors"
+                        run_results_dir = results_dir / run_name / OPT_CHECKPOINT
+                else:
+                    if run_is_exebench:
+                        dataset_name = "exebench-hf-O0-eval"
+                    else:
+                        noinline = "" if run_type == "O0" else "_noinline"
+                        if "llm4decompile" in model_name:
+                            dataset_name = f"idioms_dataset_{run_type}{noinline}_decompiler_opt_sample"
+                        else:
+                            dataset_name = f"idioms_dataset_64_tables_{run_type}{noinline}_opt_parity"
+                    run_results_dir = baseline_dir / model_name
+                    if "llm4decompile" in model_name:
+                        run_results_dir = run_results_dir / "canonical"
+                    run_results_dir = run_results_dir / dataset_name
+                    if "nova" in model_name:
+                        run_results_dir = run_results_dir / "greedy" # observed to be (very slightly) better than sampling.
+                
+                # Actually read in the results
+                try:
+                    print(f"Using {run_results_dir}")
+                    results[i][j] = read_results(run_results_dir, evaluator, eval_partition, exebench_subpartition if run_is_exebench else None)
+                except FileNotFoundError:
+                    pass
+
+                if run_is_exebench:
+                    try:
+                        exebench_results[i][j] = read_exebench_scores(run_results_dir, eval_partition, exebench_subpartition)
+                    except (FileNotFoundError, KeyError):
+                        pass
+
+        metrics: list[NDArray] = []
         axes = ["model", "run", "metric"]
-        for (_results, n_run_types, _metrics) in ((results, len(RUN_TYPES), METRICS), (exebench_results, 2, EXEBENCH_METRICS)):
-            array = np.full((len(MODEL_NAMES), n_run_types, len(_metrics)), float("nan"))
+        for (_results, n_run_types, _metrics) in ((results, len(run_types), METRICS), (exebench_results, num_exebench, EXEBENCH_METRICS)):
+            array = np.full((len(model_names), n_run_types, len(_metrics)), float("nan"))
             for i, run in enumerate(_results):
                 for j, scores in enumerate(run):
                     if scores is not None:
@@ -301,11 +395,17 @@ def main(args: argparse.Namespace):
     else:
         with open(cache, "rb") as fp:
             metrics, axes = pickle.load(fp)
+        metrics: list[NDArray]
+        main_table_shape = tuple(metrics[0].shape)
+        if causal_table:
+            assert main_table_shape == (len(MODEL_NAMES), len(RUN_TYPES), len(METRICS)), f"Incorrect results shape for table ID 1: {main_table_shape}"
+        else:
+            assert main_table_shape == (len(TABLE_2_MODELS), len(TABLE_2_RUN_TYPES), len(METRICS)), f"Incorrect results shape for table ID 2: {main_table_shape}"
 
     make_table_fn = make_terminal_table if args.table_type == "ascii" else make_latex_table
     
     print_sep = False
-    for m, labels in zip(metrics, (AXIS_INDICES, EXEBENCH_AXIS_INDICES)):
+    for m, labels in zip(metrics, (axis_indices, exebench_axis_indices)):
         regular_results = VisualizationTensor(m, axes, labels)
         new_axes = [axis for axis in axes if axis != x_axis and axis != y_axis]
         new_axes.append(y_axis)

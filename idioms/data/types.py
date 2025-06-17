@@ -529,6 +529,15 @@ class TypeLib:
             if len(entry) > 0
         }
 
+# Decoding is known to fail with DIRTY-Ghidra on typedef-types, which are assigned the ID 11 in that system.
+# ID 11 is assigned to enums in the Idioms type system.   
+class PlaceholderType:
+    """Represents a type for which decoding failed. Decompiled types are ignored anyway in favor
+    of types extracted from the original code so this placeholder fills in while allowing loading
+    to continue.
+    """
+    def __init__(self):
+        pass
 
 class TypeInfo:
     """Stores information about a type"""
@@ -597,11 +606,6 @@ class TypeInfo:
         if decl == "":
             return str(self.name)
         return f"{self.name} {decl}"
-    
-    # def user_defined_types(self) -> tuple["UDT"]:
-    #     """Return a list of user-defined types that must have definitions to interpret this type.
-    #     """
-    #     return tuple()
 
     def stubify(self) -> "TypeInfo":
         """Return the minimum form of the type assuming all other relevant types are defined elsewhere.

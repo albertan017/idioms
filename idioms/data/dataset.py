@@ -30,7 +30,7 @@ class DecompiledFunction:
         self.code_tokens = code_tokens
         self.source = source
         self.target = target
-        self._is_valid = valid
+        self._is_valid = valid # not really meaningful in idioms.
         self.raw_code = raw_code
         self.canonical_code: Optional[str] = None
         self.test_meta = test_meta
@@ -69,7 +69,7 @@ class DecompiledFunction:
     @classmethod
     def from_cf(cls, cf: CollectedFunction, **kwargs):
         """Convert from a decoded CollectedFunction"""
-        name = cf.decompiler.name
+        name = cf.debug.name # changed from .decompiler in the original DIRTY implementation.
         raw_code = cf.decompiler.raw_code
         code_tokens = tokenize_raw_code(raw_code)
 
@@ -101,7 +101,7 @@ class DecompiledFunction:
             code_tokens,
             source,
             target,
-            valid=(name == cf.debug.name and bool(source)),
+            valid=(name == cf.debug.name and bool(source)), # we weren't using this anyway, but no longer as meaningful now that name == cf.debug.name is a tautology.
             binary=kwargs["binary"],
             raw_code=raw_code,
         )
@@ -146,7 +146,6 @@ class MatchedFunction:
                  canonical_decompiled_code: str,
                  original_code: str,
                  canonical_original_code: str,
-                 memory_layout: dict[Location, Variable], # same as "source" from DecompiledFunction.code_tokens
                  variable_types: dict[str, TypeInfo], # key: variable name, value: type of that variable
                  return_type: TypeInfo, # Taken from the original code
                  user_defined_types: list[UDT],
@@ -161,14 +160,13 @@ class MatchedFunction:
         self.canonical_decompiled_code = canonical_decompiled_code
         self.original_code = original_code
         self.canonical_original_code = canonical_original_code
-        self.memory_layout = memory_layout
         self.variable_types = variable_types
         self.return_type = return_type
         self.user_defined_types = user_defined_types
         self.binary_hash = binary_hash
 
     def __eq__(self, other):
-        attrs = ["name", "repo", "decompiled_code", "canonical_decompiled_code", "original_code", "canonical_original_code", "memory_layout", "variable_types", "return_type", "user_defined_types", "binary_hash"]
+        attrs = ["name", "repo", "decompiled_code", "canonical_decompiled_code", "original_code", "canonical_original_code", "variable_types", "return_type", "user_defined_types", "binary_hash"]
         if not isinstance(other, MatchedFunction):
             return False
         for a in attrs:
@@ -200,8 +198,6 @@ class MatchedFunction:
             "canonical_decompiled_code": self.canonical_decompiled_code,
             "original_code": self.original_code,
             "canonical_original_code": self.canonical_original_code,
-            # Ignore code tokens for now; we'll use just unigram tokenization
-            "memory_layout": {loc.json_key(): var.to_json() for loc, var in self.memory_layout.items()},
             "variable_types": variable_types,
             "return_type": self.return_type._to_json(),
             "user_defined_types": user_defined_types,
@@ -210,10 +206,6 @@ class MatchedFunction:
     
     @classmethod
     def from_json(cls, d: dict[str, Any], id2type: Optional[dict[int, TypeInfo]] = None) -> "MatchedFunction":
-        memory_layout = {
-            location_from_json_key(loc): Variable.from_json(var)
-            for loc, var in d["memory_layout"].items()
-        }
         variable_types = {
             name: (cast(TypeInfo, TypeLibCodec.decode(typ)) if id2type is None else id2type[typ])
             for name, typ in d["variable_types"].items()
@@ -229,7 +221,6 @@ class MatchedFunction:
             canonical_decompiled_code=d['canonical_decompiled_code'],
             original_code=d["original_code"],
             canonical_original_code=d['canonical_original_code'],
-            memory_layout=memory_layout,
             variable_types=variable_types,
             return_type=cast(TypeInfo, TypeLibCodec.decode(json.dumps(d['return_type']))),
             user_defined_types=user_defined_types,

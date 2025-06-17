@@ -23,11 +23,14 @@ from datasets import DatasetDict, load_from_disk
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
 
+from idioms.dataiter import MatchedFunctionDataset
 from idioms.data.dataset import MatchedFunction
 from idioms.hf import causal_stringify_function_prompt
 from evaluator import (
     FunctionEvaluator,
     ORIGINAL_EXAMPLE_ATTR,
+    read_predictions,
+    read_exebench_info,
     exebench_to_matched_function,
     calculate_executable_metrics,
     write_output_to_files
@@ -40,13 +43,14 @@ def get_args():
     parser.add_argument("model_type", help="The path to/huggingface ID of the model")
     parser.add_argument("eval_dataset", help="The exebench dataset to use.")
     parser.add_argument("--compiled", help="Location of the compiled binaries corresponding to the exebench dataset.")
-    parser.add_argument("--dataset-split", default="valid_real", help="The partition of the validation set on which to evaluate.")
+    parser.add_argument("--dataset-split", type=str, help="The partition of the validation set on which to evaluate.")
     parser.add_argument("--outdir", default="baselines", help="Where to write the results summarizing the output.")
-    # parser.add_argument("--max-context-length", type=int, default=None, help="The maximum length of the pre-prediction context (the decompiled information)")
     parser.add_argument("--max-prediction-length", type=int, default=1024, help="The maximum number of new tokens to be predicted for the original function code and UDT definitions.")
     parser.add_argument("--max-decompiled-function-size", type=int, default=1024, help=f"Filter out functions with decompiled code size greater than this amount.")
     parser.add_argument("--random-seed", type=int, default=80, help=f"Used to seed python's standard random module.")
     parser.add_argument("--limit", type=int, help="Only predict this many examples.")
+    parser.add_argument("--use-existing-predictions", action="store_true", help="Instead of running prediction itself, use an existing set of predictions.")
+    parser.add_argument("--no-exebench-tests", action="store_true", help="Don't run exebench tests.")
     return parser.parse_args()
 
 ORIGINAL_INDEX_KEY = "original_index"
@@ -103,7 +107,7 @@ def build_assembly_prompt(meta: dict, binaries_dir: str, split_name: str) -> str
     input_asm_prompt = before+input_asm.strip()+after
     return input_asm_prompt
 
-def build_decompilation_prompt(meta: dict) -> str | None:
+def build_decompilation_prompt(meta: dict | MatchedFunction) -> str | None:
     """Make a prompt for decompilation-input (v2) LLM4Decompile models.
     """
     # This is directly taken from the official documentation:
@@ -111,12 +115,13 @@ def build_decompilation_prompt(meta: dict) -> str | None:
     # Even for ghidra decompilation, the prompt says "assembly code."
     before = f"# This is the assembly code:\n"#prompt
     after = "\n# What is the source code?\n"#prompt
-    if meta['ghidra'] is None:
+    if isinstance(meta, dict) and meta['ghidra'] is None:
         return None
     with tempfile.TemporaryDirectory() as tempdir:
         c_file = os.path.join(tempdir, "temp.c")
         with open(c_file, "w") as fp:
-            fp.write(meta['ghidra'].strip())
+            decompiled_code = meta.canonical_decompiled_code if isinstance(meta, MatchedFunction) else meta['ghidra'].strip()
+            fp.write(decompiled_code)
         run = subprocess.run([CLANG_FORMAT, c_file], capture_output=True)
          # clang-format writes the formatted code stdout.
         formatted = run.stdout.decode()
@@ -136,6 +141,8 @@ def main(args: argparse.Namespace):
     limit = args.limit
     outdir = Path(args.outdir) / model_type.split("/")[1] / eval_dataset.name
     os.makedirs(outdir, exist_ok=True)
+    do_prediction: bool = not args.use_existing_predictions
+    do_exebench_tests: bool = not args.no_exebench_tests
 
     assert "llm4decompile" in model_type.lower(), f"This script only suppots LLM4Decompile models."
 
@@ -156,68 +163,101 @@ def main(args: argparse.Namespace):
     print(f"Optimization: {optimization}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_type)
-    model = AutoModelForCausalLM.from_pretrained(model_type, torch_dtype=torch.bfloat16).cuda()
 
     def function_size_filter(fn: MatchedFunction) -> bool:
         """Return True if the decompiled code fits within the allowed context size.
         """
-        # Note: this actually uses the hex-rays size to be consistent with evaluator.py, (that way, the same functions are filtered out)
-        # though llm4decompile in its unmodified form uses ghidra.
         return len(tokenizer.encode(causal_stringify_function_prompt(fn))) <= max_decompiled_function_size
 
-    raw_dataset = load_from_disk(eval_dataset)
-    if isinstance(raw_dataset, DatasetDict):
-        raw_dataset = raw_dataset[split_name]
-    
-    raw_dataset = raw_dataset.add_column("index", list(range(len(raw_dataset)))) # type: ignore
-    holdout_set = list(filter(function_size_filter, filter(None, map(exebench_to_matched_function, raw_dataset)))) # type: ignore
-    if limit is not None:
-        random.shuffle(holdout_set)
-        holdout_set = holdout_set[:limit]
+    dataset_is_exebench = (eval_dataset / "dataset_info.json").exists() or (eval_dataset / "dataset_dict.json").exists()
+    assert not dataset_is_exebench or not use_assembly, f"Can only use assembly for exebench-style datsets"
+    if args.dataset_split is None:
+        split_name = "test_real" if dataset_is_exebench else "test"
+    else:
+        split_name = args.dataset_split
 
-    # Gets rid of the following warning: 
-    #   Setting `pad_token_id` to `eos_token_id`:None for open-end generation.
-    model.generation_config.pad_token_id = tokenizer.pad_token_id
+    if do_prediction:
+        model = AutoModelForCausalLM.from_pretrained(model_type, torch_dtype=torch.bfloat16).cuda()
+        
+        if dataset_is_exebench:
+            raw_dataset = load_from_disk(eval_dataset)
+            if isinstance(raw_dataset, DatasetDict):
+                raw_dataset = raw_dataset[split_name]
+            
+            raw_dataset = raw_dataset.add_column("index", list(range(len(raw_dataset)))) # type: ignore
+            holdout_set = list(filter(function_size_filter, filter(None, map(exebench_to_matched_function, raw_dataset)))) # type: ignore
+        else:
+            holdout_set = list(filter(function_size_filter, MatchedFunctionDataset(eval_dataset.glob(f"{split_name}*.tar"))))
+        if limit is not None:
+            random.shuffle(holdout_set)
+            holdout_set = holdout_set[:limit]
 
-    unable_to_generate_prompt = 0
-    ooms = 0
+        # Gets rid of the following warning: 
+        #   Setting `pad_token_id` to `eos_token_id`:None for open-end generation.
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
 
-    results = []
-    with tempfile.TemporaryDirectory() as binaries_dir:
-        if use_assembly:
-            for shard in compiled.iterdir():
-                assert ".tar" in shard.name
-                with tarfile.open(shard, "r:*") as tf:
-                    tf.extractall(path=binaries_dir)
+        unable_to_generate_prompt = 0
+        ooms = 0
 
-        for fn in tqdm(holdout_set, dynamic_ncols=True):
-            # exebench assembly is slightly different than the assembly 
-            # generated by the authors' process so we'll use the authors' process here.
-            meta = getattr(fn, ORIGINAL_EXAMPLE_ATTR)
+        results = []
+        with tempfile.TemporaryDirectory() as binaries_dir:
             if use_assembly:
-                prompt = build_assembly_prompt(meta, binaries_dir, split_name)
-            else:
-                prompt = build_decompilation_prompt(meta)
+                for shard in compiled.iterdir():
+                    assert ".tar" in shard.name
+                    with tarfile.open(shard, "r:*") as tf:
+                        tf.extractall(path=binaries_dir)
 
-            if prompt is None:
-                unable_to_generate_prompt += 1
-                continue
+            for fn in tqdm(holdout_set, dynamic_ncols=True):
+                meta = getattr(fn, ORIGINAL_EXAMPLE_ATTR) if dataset_is_exebench else fn
+                if use_assembly:
+                    # could theoretically support this in the future too. However, the current process is flawed
+                    # because it leaks function names in the assembly code. To prevent this, we'd have to add a binary-stripping
+                    # step and match functions based on addresses, which would be much more involved.
+                    # assert isinstance(meta, dict), f"Assembly mode only supported for exebench-style datasets."
+                    assert False, "Assembly mode currently not supported."
 
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-            try:
-                with torch.no_grad():
-                    outputs = model.generate(**inputs, max_new_tokens=max_prediction_length)
-            except torch.cuda.OutOfMemoryError:
-                ooms += 1
-            prediction = tokenizer.decode(outputs[0][len(inputs[0]):-1]) # type: ignore
-            results.append((fn, prediction))
+                    # exebench assembly is slightly different than the assembly 
+                    # generated by the authors' process so we'll use the authors' process here.
+                    prompt = build_assembly_prompt(meta, binaries_dir, split_name)
+                else:
+                    prompt = build_decompilation_prompt(meta)
+
+                if prompt is None:
+                    unable_to_generate_prompt += 1
+                    continue
+
+                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                try:
+                    with torch.no_grad():
+                        outputs = model.generate(**inputs, max_new_tokens=max_prediction_length)
+                except torch.cuda.OutOfMemoryError:
+                    ooms += 1
+                prediction = tokenizer.decode(outputs[0][len(inputs[0]):-1]) # type: ignore
+                results.append((fn, prediction))
+
+        # Save the predictions as soon as we finish with them.
+        if dataset_is_exebench:
+            exebench_info = [getattr(r[0], ORIGINAL_EXAMPLE_ATTR) for r in results]
+        else:
+            exebench_info = None
+        write_output_to_files(results, outdir / f"{split_name}_results", exebench_info)
+    else:
+        results = read_predictions(outdir / f"{split_name}_results.json")
+        if dataset_is_exebench:
+            exebench_info = read_exebench_info(outdir / f"{split_name}_results_exebench_info.json")
+        else:
+            exebench_info = None
+        with open(outdir / f"{split_name}_scores.json", "r") as fp:
+            scores = json.load(fp)
+        ooms = scores["out_of_memory_errors"]
+        unable_to_generate_prompt = scores["unable_to_generate_prompt"]
+        del scores
     
     evaluator = FunctionEvaluator()
     scores = evaluator(results)
-
-    exebench_info = [getattr(r[0], ORIGINAL_EXAMPLE_ATTR) for r in results]
-    write_output_to_files(results, outdir / f"{args.dataset_split}_results", exebench_info)
-    scores |= calculate_executable_metrics(results, exebench_info)
+    
+    if dataset_is_exebench and do_exebench_tests:
+        scores |= calculate_executable_metrics(results, exebench_info) # type: ignore
     scores["unable_to_generate_prompt"] = unable_to_generate_prompt
     scores["out_of_memory_errors"] = ooms
 
@@ -225,7 +265,7 @@ def main(args: argparse.Namespace):
         print(score, value)
     print()
 
-    with open(outdir / f"{args.dataset_split}_scores.json", "w") as fp:
+    with open(outdir / f"{split_name}_scores.json", "w") as fp:
         json.dump(scores, fp, indent=2)
 
     

@@ -9,7 +9,7 @@ There are five main sections:
 - Evaluation
 - LLM4Decompile Baseline
 
-The datasets and trained models and adapters are available [here](https://zenodo.org/records/14797017).
+The datasets and trained models and adapters are available [here](https://doi.org/10.5281/zenodo.14797016).
 
 With the provided datasets, you can skip to the Training section.
 With the provided datasets and pretrained models/adapters, you can skip to the Evaluation section.
@@ -40,9 +40,10 @@ docker build -t gcc-custom .
 
 To build the binaries for the dataset, run
 ```
-python main.py --repo-list-file repo_list.txt --n-procs 5
+python main.py --repo-list-file repo_list.txt --n-procs 5 --gcc-override-flags="-g -O0"
 ```
-
+We performed this process at all four levels of optimization (O0 through O3).
+For optimizations above O0, disable inlining, e.g. `--gcc-override-flags="-g -O1 -fno-partial-inlining -fno-inline"`
 
 To preprocess the code, run
 ```
@@ -50,7 +51,7 @@ python extract_original.py binaries/ archives/ preprocessed
 ```
 The latter two are very expensive commands, and may take up to several weeks to run.
 
-We use scripts from DIRTY [1] to do the decompilation. For our main experiments, we used the original version which uses the proprietary Hex-Rays decompiler. There is also a version based on the open-source Ghidra decompiler. We use this for our baselining experiments.
+We use scripts from DIRTY [1] to do the decompilation. For our main experiments, we used the original version which uses the proprietary Hex-Rays decompiler. There is also a version based on the open-source Ghidra decompiler, which we use to generate data for LLM4Decompile [2] for copmarison. We use this for our baselining experiments.
 
 Clone these repositories with
 ```
@@ -94,8 +95,79 @@ python deduplicate.py /path/to/archives/ dedup-clusters.json --lexical --workers
 
 After these steps, there is enough information to build the full realtype dataset. To do this, run
 ```
-python prepare.py /path/to/decompiled-hex-rays /path/to/binaries/ /path/to/preprocessed/ dedup-clusters.json idioms_dataset --holdout-set-size 0.02 --valid-max-bins-per-repo 1 --test-max-bins-per-repo 25 --shard-size 500
+python prepare.py /path/to/decompiled-hex-rays /path/to/binaries/ /path/to/preprocessed/ dedup-clusters.json idioms_dataset_O0 --holdout-set-size 0.02 --valid-max-bins-per-repo 1 --test-max-bins-per-repo 25 --shard-size 500
 ```
+
+We performed this process on the O0 dataset.
+We built the dataset at other levels of optimization using the train/validation/test splits produced by the initial run of the script.
+To do this, we used the commands:
+
+```
+# O1
+python prepare.py /path/to/decompiled-O1/ /path/to/binaries-O1/ /path/to/preprocessed/ idioms_dataset_O0/test_repos.txt idioms_dataset_O1 --shard-size 500 --single-split-name test --workers 5
+
+python prepare.py /path/to/decompiled-O1/ /path/to/binaries-O1/ /path/data/preprocessed/ idioms_dataset_O0/validation_repos.txt idioms_dataset_O1 --shard-size 500 --single-split-name validation --reuse-existing-dir --workers 5
+
+python prepare.py /path/to/decompiled-O1/ /path/to/binaries-O1/ /path/data/preprocessed/ idioms_dataset_O0/train_repos.txt idioms_dataset_O1 --shard-size 500 --single-split-name train --reuse-existing-dir --workers 5
+
+# O2
+python python prepare.py /path/to/decompiled-O2/ /path/to/binaries-O2/ /path/to/preprocessed/ idioms_dataset_O0/test_repos.txt idioms_dataset_O2 --shard-size 500 --single-split-name test --workers 5
+
+python prepare.py /path/to/decompiled-O2/ /path/to/binaries-O2/ /path/to/preprocessed/ idioms_dataset_O0/validation_repos.txt idioms_dataset_O2 --shard-size 500 --single-split-name validation --reuse-existing-dir --workers 5
+
+python prepare.py /path/to/decompiled-O2/ /path/to/binaries-O2/ /path/to/preprocessed/ idioms_dataset_O0/train_repos.txt idioms_dataset_O2 --shard-size 500 --single-split-name train --reuse-existing-dir --workers 5
+
+# O3
+python prepare.py /path/to/decompiled-O3/ /path/to/binaries-O3/ /path/to/preprocessed/ idioms_dataset_O0/train_repos.txt idioms_dataset_O3 --shard-size 500 --single-split-name train
+
+python prepare.py /path/to/decompiled-O3/ /path/to/binaries-O3/ /path/to/preprocessed/ idioms_dataset_O0/validation_repos.txt idioms_dataset_O3 --shard-size 500 --single-split-name validation --reuse-existing-dir
+
+python prepare.py /path/to/decompiled-O3/ /path/to/binaries-O3/ /path/to/preprocessed/ idioms_dataset_O0/test_repos.txt idioms_dataset_O3 --shard-size 500 --single-split-name test --reuse-existing-dir
+```
+
+The decompilation process does not always succeed for all all binaries at all levels of optimization. To control for this, run
+
+```
+make_parity_idioms_dataset.py idioms_dataset_O0/ idioms_dataset_O1_noinline/ idioms_dataset_O2_noinline/ idioms_dataset_O3_noinline/
+```
+
+### Preparing Realtype for Nova and LLM4Decompile
+
+We also evaluate LLM4Decompile-Ref [2] and Nova+ [3] on Realtype.
+The former uses assembly as input, and LLM4Decompile uses Ghidra decomiplation as input.
+
+For Nova, we simply package the binaries into tar files, and the evaluation script will extract and normalize the relevant assembly at evaluation time.
+
+Run
+```
+mkdir idioms_dataset_binary_archives
+python archive_idioms_binaries.py idioms_dataset_O0 idioms_dataset_binary_archives /path/to/O0_binaries
+python archive_idioms_binaries.py idioms_dataset_O1_noinline idioms_dataset_binary_archives /path/to/O1_noinline_binaries
+python archive_idioms_binaries.py idioms_dataset_O2_noinline idioms_dataset_binary_archives /path/to/O2_noinline_binaries
+python archive_idioms_binaries.py idioms_dataset_O3_noinline idioms_dataset_binary_archives /path/to/O3_noinline_binaries
+```
+
+For LLM4Decompile, we run `prepare.py` again, but using Ghidra data as input. Because we're only evaluating, not training, we only need the test set. Run
+```
+mkdir idioms_ghidra_datasets
+python prepare.py /path/to/ghidra_O0_decompiled /path/to/O0_binaries /path/to/preprocessed idioms_dataset_O0/test_repos.txt idioms_ghidra_datasets/idioms_dataset_O0 --single-split-name test
+
+python prepare.py /path/to/ghidra_O1_noinline_decompiled /path/to/O1_noinline_binaries /path/to/preprocessed idioms_dataset_O0/test_repos.txt idioms_ghidra_datasets/idioms_dataset_O1_noinline --single-split-name test
+
+python prepare.py /path/to/ghidra_O2_noinline_decompiled /path/to/O2_noinline_binaries /path/to/preprocessed idioms_dataset_O0/test_repos.txt idioms_ghidra_datasets/idioms_dataset_O2_noinline --single-split-name test
+
+python prepare.py /path/to/ghidra_O3_noinline_decompiled /path/to/O3_noinline_binaries /path/to/preprocessed idioms_dataset_O0/test_repos.txt idioms_ghidra_datasets/idioms_dataset_O3_noinline --single-split-name test
+```
+
+Then make sure that the datasets only contain examples from the test repositories that are in the original realtype dataset.
+
+```
+python make_parity_idioms_dataset.py idioms_dataset_O0_opt_parity idioms_ghidra_datasets/idioms_dataset_O0/ --test-only --output-suffix decompiler_opt_sample --skip-first-write
+python make_parity_idioms_dataset.py idioms_dataset_O0_opt_parity idioms_ghidra_datasets/idioms_dataset_O1_noinline/ --test-only --output-suffix decompiler_opt_sample --skip-first-write
+python make_parity_idioms_dataset.py idioms_dataset_O0_opt_parity idioms_ghidra_datasets/idioms_dataset_O2_noinline/ --test-only --output-suffix decompiler_opt_sample --skip-first-write
+python make_parity_idioms_dataset.py idioms_dataset_O0_opt_parity idioms_ghidra_datasets/idioms_dataset_O3_noinline/ --test-only --output-suffix decompiler_opt_sample --skip-first-write
+```
+
 
 # Adapting the Exebench Dataset
 
@@ -154,13 +226,29 @@ For more information on using unsloth, see [the pypi page](https://pypi.org/proj
 
 To train the models, do the following:
 
+### Experiment Set 1: Direct Comparison
+
+#### Idioms
+
+```
+python tune-unsloth.py idioms_dataset_O0_opt_parity opt-O0-codegemma-7b-neighbors neighbors adapter --epochs 8.0 --model-type unsloth/codegemma-7b-bnb-4bit --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
+
+python tune-unsloth.py idioms_dataset_O1_noinline_opt_parity opt-O1-codegemma-7b-neighbors neighbors adapter --epochs 8.0 --model-type unsloth/codegemma-7b-bnb-4bit --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
+
+python tune-unsloth.py idioms_dataset_O2_noinline_opt_parity opt-O2-codegemma-7b-neighbors neighbors adapter --epochs 8.0 --model-type unsloth/codegemma-7b-bnb-4bit --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
+
+python tune-unsloth.py idioms_dataset_O3_noinline_opt_parity opt-O3-codegemma-7b-neighbors neighbors adapter --epochs 8.0 --model-type unsloth/codegemma-7b-bnb-4bit --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
+```
+
+### Experiment Set 2: Ablation Study
+
 For the CodeQwen2.5 experiments
 
 ```
 python train.py exebench-idioms-O0 qwen-0.5b-exebench-O0 function finetune --epochs 8.0 --model-type Qwen/Qwen2.5-Coder-0.5B --batch-size 8 --gradient-accumulation 8
 python train.py parity-exebench-idioms-O0 qwen-0.5b-parity-exebench-O0 function finetune --epochs 8.0 --model-type Qwen/Qwen2.5-Coder-0.5B --batch-size 8 --gradient-accumulation 8
-python train.py idioms_dataset qwen-0.5b-functions-idioms function finetune --epochs 8.0 --model-type Qwen/Qwen2.5-Coder-0.5B --batch-size 8 --gradient-accumulation 8
-python train.py idioms_dataset qwen-0.5b-neighbors-idioms neighbors finetune --epochs 8.0 --model-type Qwen/Qwen2.5-Coder-0.5B --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
+python train.py idioms_dataset_O0 qwen-0.5b-functions-idioms function finetune --epochs 8.0 --model-type Qwen/Qwen2.5-Coder-0.5B --batch-size 8 --gradient-accumulation 8
+python train.py idioms_dataset_O0 qwen-0.5b-neighbors-idioms neighbors finetune --epochs 8.0 --model-type Qwen/Qwen2.5-Coder-0.5B --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
 
 ```
 
@@ -169,8 +257,8 @@ For the modified LLM4Decompile experiments
 ```
 python train.py exebench-idioms-O0 llm4decompile-1.3b-exebench-O0 function adapter --epochs 2.0 --model-type LLM4Binary/llm4decompile-1.3b-v2 --batch-size 8 --gradient-accumulation 8
 python train.py parity-exebench-idioms-O0 llm4decompile-1.3b-parity-exebench-O0 function adapter --epochs 8.0 --model-type LLM4Binary/llm4decompile-1.3b-v2 --batch-size 8 --gradient-accumulation 8
-python train.py idioms_dataset llm4decompile-1.3b-functions-idioms function adapter --epochs 8.0 --model-type LLM4Binary/llm4decompile-1.3b-v2 --batch-size 16 --gradient-accumulation 4
-python train.py idioms_dataset llm4decompile-1.3b-neighbors-idioms neighbors adapter --epochs 8.0 --model-type LLM4Binary/llm4decompile-1.3b-v2 --batch-size 16 --gradient-accumulation 4 --nhops 4 --max-length 4096
+python train.py idioms_dataset_O0 llm4decompile-1.3b-functions-idioms function adapter --epochs 8.0 --model-type LLM4Binary/llm4decompile-1.3b-v2 --batch-size 16 --gradient-accumulation 4
+python train.py idioms_dataset_O0 llm4decompile-1.3b-neighbors-idioms neighbors adapter --epochs 8.0 --model-type LLM4Binary/llm4decompile-1.3b-v2 --batch-size 16 --gradient-accumulation 4 --nhops 4 --max-length 4096
 
 ```
 
@@ -179,8 +267,8 @@ For the CodeGemma-2b experiments
 ```
 python train.py exebench-idioms-O0 codegemma-2b-exebench-O0 function adapter --epochs 2.0 --model-type unsloth/codegemma-2b-bnb-4bit --batch-size 8 --gradient-accumulation 8
 python train.py parity-exebench-idioms-O0 codegemma-2b-parity-exebench-O0 function adapter --epochs 8.0 --model-type unsloth/codegemma-2b-bnb-4bit --batch-size 8 --gradient-accumulation 8
-python train.py idioms_dataset codegemma-2b-functions-idioms function adapter --epochs 8.0 --model-type unsloth/codegemma-2b-bnb-4bit --batch-size 8 --gradient-accumulation 8
-python train.py idioms_dataset codegemma-2b-neighbors-idioms neighbors adapter --epochs 8.0 --model-type unsloth/codegemma-2b-bnb-4bit --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
+python train.py idioms_dataset_O0 codegemma-2b-functions-idioms function adapter --epochs 8.0 --model-type unsloth/codegemma-2b-bnb-4bit --batch-size 8 --gradient-accumulation 8
+python train.py idioms_dataset_O0 codegemma-2b-neighbors-idioms neighbors adapter --epochs 8.0 --model-type unsloth/codegemma-2b-bnb-4bit --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
 
 ```
 
@@ -190,8 +278,8 @@ For the CodeGemma-7b experiments
 ```
 python train.py exebench-idioms-O0 codegemma-7b-exebench-O0 function adapter --epochs 1.0 --model-type unsloth/codegemma-7b-bnb-4bit --batch-size 8 --gradient-accumulation 8
 python train.py parity-exebench-idioms-O0 codegemma-7b-parity-exebench-O0 function adapter --epochs 8.0 --model-type unsloth/codegemma-7b-bnb-4bit --batch-size 8 --gradient-accumulation 8
-python train.py idioms_dataset codegemma-7b-functions-idioms function adapter --epochs 8.0 --model-type unsloth/codegemma-7b-bnb-4bit --batch-size 8 --gradient-accumulation 8
-python train.py idioms_dataset codegemma-7b-neighbors-idioms neighbors adapter --epochs 8.0 --model-type unsloth/codegemma-7b-bnb-4bit --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
+python train.py idioms_dataset_O0 codegemma-7b-functions-idioms function adapter --epochs 8.0 --model-type unsloth/codegemma-7b-bnb-4bit --batch-size 8 --gradient-accumulation 8
+python train.py idioms_dataset_O0 codegemma-7b-neighbors-idioms neighbors adapter --epochs 8.0 --model-type unsloth/codegemma-7b-bnb-4bit --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
 ```
 
 For the CodeLlama-7b experiments
@@ -199,8 +287,8 @@ For the CodeLlama-7b experiments
 ```
 python train.py exebench-idioms-O0 codellama-7b-exebench-O0 function adapter --epochs 1.0 --model-type unsloth/codellama-7b-bnb-4bit --batch-size 8 --gradient-accumulation 8
 python train.py parity-exebench-idioms-O0 codellama-7b-parity-exebench-O0 function adapter --epochs 8.0 --model-type unsloth/codellama-7b-bnb-4bit --batch-size 8 --gradient-accumulation 8
-python train.py idioms_dataset codellama-7b-functions-idioms function adapter --epochs 8.0 --model-type unsloth/codellama-7b-bnb-4bit --batch-size 8 --gradient-accumulation 8
-python train.py idioms_dataset codellama-7b-neighbors-idioms neighbors adapter --epochs 8.0 --model-type unsloth/codellama-7b-bnb-4bit --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
+python train.py idioms_dataset_O0 codellama-7b-functions-idioms function adapter --epochs 8.0 --model-type unsloth/codellama-7b-bnb-4bit --batch-size 8 --gradient-accumulation 8
+python train.py idioms_dataset_O0 codellama-7b-neighbors-idioms neighbors adapter --epochs 8.0 --model-type unsloth/codellama-7b-bnb-4bit --batch-size 4 --gradient-accumulation 16 --nhops 4 --max-length 4096
 ```
 
 # Evaluation
@@ -213,7 +301,58 @@ pip install .
 cd ..
 ```
 
-Most experiments are trained to 8 epochs, but it's possible that some models will start to overfit before then.
+Models evaluated on the exebench test run also need their unit tests to be run; the fraction of runs which pass all of the unit tests is an additional metric.
+Running the unit tests tooks around 6 hours per model on our machine vs around a few minutes for all other metrics combined, so `eval_all.py` skips running them.
+Running arbitrary machine-learning-generated code can be dangerous, so we provide a docker image for containers in which the tests are actually run.
+To build the image and compute exebench metrics, run
+```
+docker build -t exebench-test exebench_docker/
+python test_exebench.py 
+```
+
+### Experiment Set 1
+
+#### Idioms
+
+If you built your own datasets from scrach simply use the last checkpoint instead of `checkpoint-13280`.
+```
+python evaluator.py runs/opt-O0-codegemma-7b-neighbors/checkpoint-13280 --eval-partition test --batch-size 8
+python evaluator.py runs/opt-O1-codegemma-7b-neighbors/checkpoint-13280 --eval-partition test --batch-size 8
+python evaluator.py runs/opt-O2-codegemma-7b-neighbors/checkpoint-13280 --eval-partition test --batch-size 8
+python evaluator.py runs/opt-O3-codegemma-7b-neighbors/checkpoint-13280 --eval-partition test --batch-size 8
+```
+We use the `codegemma-7b-exebench-O0` results from experiment set 2, below, for results on exebench.
+
+#### LLM4Decompile
+
+```
+# Exebench
+python llm4decompile.py LLM4Binary/llm4decompile-6.7b-v2 exebench-hf-O0-eval --no-exebench-tests
+
+# Realtype
+python llm4decompile.py LLM4Binary/llm4decompile-6.7b-v2 idioms_ghidra_datasets/idioms_dataset_O0_decompiler_opt_sample
+python llm4decompile.py LLM4Binary/llm4decompile-6.7b-v2 idioms_ghidra_datasets/idioms_dataset_O1_noinline_decompiler_opt_sample
+python llm4decompile.py LLM4Binary/llm4decompile-6.7b-v2 idioms_ghidra_datasets/idioms_dataset_O2_noinline_decompiler_opt_sample
+python llm4decompile.py LLM4Binary/llm4decompile-6.7b-v2 idioms_ghidra_datasets/idioms_dataset_O3_noinline_decompiler_opt_sample
+```
+
+#### Nova
+
+```
+# Exebench
+python nova.py lt-asset/nova-6.7b-bcr exebench-hf-O0-eval exebench-binary-archives/compiled-O0 --greedy
+
+# Realtype
+python nova.py lt-asset/nova-6.7b-bcr idioms_dataset_O0_opt_parity/ idioms_dataset_binary_archives/idioms_dataset_O0_opt_parity_test_binaries.tar.gz --greedy
+python nova.py lt-asset/nova-6.7b-bcr idioms_dataset_O1_noinline_opt_parity idioms_dataset_binary_archives/idioms_dataset_O1_noinline_opt_parity_test_binaries.tar.gz --greedy
+python nova.py lt-asset/nova-6.7b-bcr idioms_dataset_O2_noinline_opt_parity idioms_dataset_binary_archives/idioms_dataset_O2_noinline_opt_parity_test_binaries.tar.gz --greedy
+python nova.py lt-asset/nova-6.7b-bcr idioms_dataset_O3_noinline_opt_parity idioms_dataset_binary_archives/idioms_dataset_O3_noinline_opt_parity_test_binaries.tar.gz --greed
+```
+
+
+### Experiment Set 2
+
+Most experiments are trained to 8 epochs, but especially on the easier tasks, it's possible that some models will start to overfit before then.
 To account for this, run validation on each model that has eight or more epochs of training using
 ```
 python eval_all.py
@@ -240,16 +379,6 @@ python evaluator.py runs/llm4decompile-1.3b-exebench-O0/ --eval-partition test -
 python evaluator.py runs/codegemma-2b-exebench-O0/ --eval-partition test --batch-size 32 --dataset exebench-hf-O0-eval --exebench-subpartition real --no-exebench-tests
 python evaluator.py runs/codegemma-7b-exebench-O0/ --eval-partition test --batch-size 32 --dataset exebench-hf-O0-eval --exebench-subpartition real --no-exebench-tests
 python evaluator.py runs/codellama-7b-exebench-O0/ --eval-partition test --batch-size 32 --dataset exebench-hf-O0-eval --exebench-subpartition real --no-exebench-tests
-```
-
-Models evaluated on the exebench test run also need their unit tests to be run; the fraction of runs which pass all of the unit tests is an additional metric.
-Running the unit tests tooks around 6 hours per model on our machine vs around a minute
-for all other metrics combined, so `eval_all.py` skips running them.
-Running arbitrary machine-learning-generated code can be dangerous, so we provide a docker image for containers in which the tests are actually run.
-To build the image and compute exebench metrics, run
-```
-docker build -t exebench-test exebench_docker/
-python test_exebench.py 
 ```
 
 Finally, summarize and display the final results with
@@ -288,3 +417,7 @@ The results will be in `baselines/llm4decompile-1.3b-v2/exebench-hf-O0-eval/test
 # Reference
 
 [1] Chen, Qibin, et al. "Augmenting decompiler output with learned variable names and types." 31st USENIX Security Symposium (USENIX Security 22). 2022.
+
+[2] Tan, Hanzhuo, et al. "LLM4Decompile: Decompiling Binary Code with Large Language Models." Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing (EMNLP). 2024.
+
+[3] Nan Jiang, et al. "Nova: Generative Language Models for Assembly Code with Hierarchical Attention and Contrastive Learning." The Thirteenth International Conference on Learning Representations (ICLR). April 2025.

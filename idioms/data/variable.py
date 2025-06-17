@@ -8,9 +8,9 @@ from typing import Any
 
 # Huge hack to get importing to work with the decompiler
 try:
-    from idioms.data.types import TypeLibCodec, TypeInfo
+    from idioms.data.types import TypeLibCodec, TypeInfo, PlaceholderType
 except ImportError:
-    from .types import TypeLibCodec, TypeInfo
+    from .types import TypeLibCodec, TypeInfo, PlaceholderType
 
 class Location:
     """A variable location"""
@@ -92,7 +92,10 @@ class Variable:
 
     @classmethod
     def from_json(cls, d):
-        typ = TypeLibCodec.decode(dumps(d["t"]))
+        try:
+            typ = TypeLibCodec.decode(dumps(d["t"]))
+        except KeyError:
+            typ = PlaceholderType()
         return cls(typ=typ, name=d["n"], user=d["u"])
 
     def __eq__(self, other: Any) -> bool:

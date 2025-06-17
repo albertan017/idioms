@@ -221,7 +221,6 @@ def clone_and_compile(repo_info: RepoInfo, clone_folder: str, binary_folder: str
     # add git_commit_hash to the meta info
     repo_info.commit_hash = subprocess.run(["git", "rev-parse", "HEAD"], cwd=os.path.join(clone_folder, repo_folder_name), check=True, stdout=subprocess.PIPE).stdout.decode("utf8").strip()
 
-    gcc_override_flags += " -O0"
     repo_info.compiled = False
 
     makefiles = None
@@ -254,10 +253,6 @@ def clone_and_compile(repo_info: RepoInfo, clone_folder: str, binary_folder: str
         if not os.path.exists(repo_binary_dir):
             os.makedirs(repo_binary_dir)
         flutes.log(f"Starting compilation for {repo_full_name}...")
-
-        # add optimization level to compile with (compiled everything with O0)
-        opt = "O0"
-        repo_info.optimization = opt
 
         if docker_batch_compile:
             makefiles = ghcc.docker_batch_compile(

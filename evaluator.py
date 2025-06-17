@@ -8,6 +8,7 @@ import random
 import json
 import sys
 import re
+import time
 import tempfile
 import subprocess
 import itertools
@@ -15,13 +16,14 @@ from collections import Counter
 from pathlib import Path
 from typing import Iterable, Callable, TypeVar, Any, Container
 
+import z3
 import torch
 from torch.utils.data import DataLoader
 import tree_sitter_c
 from tree_sitter import Node, Parser, Language
 from nltk.translate.bleu_score import sentence_bleu
 import numpy as np
-from datasets import load_from_disk, DatasetDict
+from datasets import load_from_disk, Dataset, DatasetDict
 from numpy.typing import NDArray
 from tqdm import tqdm
 from peft import PeftModel # type: ignore # mypy thinks that PeftModel is a private class.
@@ -57,11 +59,23 @@ from idioms.hf import (
     DECOMPILED_ORIG_SEP
 )
 from codealign import align, Alignment
-from codealign.ir import Variable, Parameter, GlobalVariable
-from codealign.lang.c import ParsingError, SemanticError
+from codealign.ir import (
+    Variable, 
+    Parameter, 
+    GlobalVariable, 
+    SSAOperator,
+    FunctionSSAOperator,
+    FunctionVarOperator,
+    STORE_OP
+)
+from codealign.align import UnionFind
+from codealign.lang.c import ParsingError, SemanticError, parse
 
 ADAPTER_NAME="decomp_fn_rewrite"
 ORIGINAL_EXAMPLE_ATTR = "raw_exebench_example"
+GENERIC_FUNCTION_NAME = "func_"
+GENERIC_FIELD_NAME = "field_"
+AGGREGATE_SOLVER_TIMEOUT = 60 # seconds
 
 C_LANGUAGE = Language(tree_sitter_c.language())
 parser = Parser(C_LANGUAGE)
@@ -92,6 +106,7 @@ class FunctionEvaluator:
             "bleu",
             "syntatically_valid",
             "semantically_valid",
+            "consistently_aligned",
             "perfectly_aligned",
             "perfectly_aligned_and_typechecks",
             "variable_name_accuracy",
@@ -100,7 +115,8 @@ class FunctionEvaluator:
             "variable_udt_composition_matches",
             "variables_inherently_alignable",
             "oracle_has_nonexistent_field",
-            "codealign_failures"
+            "codealign_failures",
+            "consistency_solver_timeouts"
         ]
         self.write_output_to = write_output_to
         self.lexer = CLexer()
@@ -119,7 +135,7 @@ class FunctionEvaluator:
             self.predictions = list(predictions)
         errors_during_evaluation = 0
         metric_values = {m: list() for m in self.metric_names}
-        for ground_truth, prediction in predictions:
+        for ground_truth, prediction in tqdm(predictions):
             metric_values["bleu"].append(self.bleu(ground_truth, prediction))
      
             try:
@@ -176,6 +192,7 @@ class FunctionEvaluator:
         metrics = {
             "syntatically_valid": 0,
             "semantically_valid": 0,
+            "consistently_aligned": 0,
             "perfectly_aligned": 0,
             "perfectly_aligned_and_typechecks": 0,
             "variable_name_accuracy": (0, alignable_variables),
@@ -184,7 +201,8 @@ class FunctionEvaluator:
             "variable_udt_composition_matches": (0, alignable_udt_variables),
             "variables_inherently_alignable": variables_inherently_alignable,
             "oracle_has_nonexistent_field": 0,
-            "codealign_failures": 0
+            "codealign_failures": 0,
+            "consistency_solver_timeouts": 0
         }
 
         ### Parse and sort nodes
@@ -257,6 +275,15 @@ class FunctionEvaluator:
         metrics["perfectly_aligned"] = is_perfectly_aligned
         metrics["syntatically_valid"] = 1
         metrics["semantically_valid"] = 1
+
+        try:
+            # get_consistent_alignment checks perfectly_aligned as a condition to return an alignment, so we don't need to check it again.
+            # If consistent_alignment is not None, then the alignment must be perfect.
+            consistent_alignment = get_consistent_alignment(fn, fn_node.text.decode())
+            metrics["consistently_aligned"] = consistent_alignment is not None
+        except AggregateSolverTimeoutError:
+            metrics["consistency_solver_timeouts"] = 1
+            del metrics["consistently_aligned"] # this is a failure of our solver; we don't want to penalize or reward the model for it.
 
         if predicted_fn is None:    
             return metrics
@@ -561,7 +588,7 @@ class NonexistentFieldError(Exception):
 
 def canonicalize_udt_field_names(code: str, variable_types: dict[str, TypeInfo], user_defined_types: list[UDT]) -> str:
     """Replace all field names used in field expressions (e.g point.x or point->x) with the
-    same standard name "field".
+    standard name "fieldX", where X is the index of the field in the corresponding type.
     """
     # For field_expressions:
     # expression.children[0]: (argument) - an expression that resolves to the struct
@@ -590,6 +617,12 @@ def canonicalize_udt_field_names(code: str, variable_types: dict[str, TypeInfo],
     root = parser.parse(bytes(code, 'utf8')).root_node
     find_field_expression(root) # populate the list 'edits'
 
+    return edit_function(root, edits)
+
+def edit_function(root: Node, edits: list[tuple[Node, str]]) -> str:
+    """For the code represented in the ast rooted at `root`, replace each node in the `edits` list
+    with the corresponding string.
+    """
     # Sorting edits in reverse order reduces the offset bookkeeping we have to do.
     edits.sort(key=lambda x: x[0].start_byte, reverse=True)
     assert all(a[0].start_byte > b[0].end_byte for a, b in zip(edits, itertools.islice(edits, 1, None)))
@@ -605,6 +638,337 @@ def canonicalize_udt_field_names(code: str, variable_types: dict[str, TypeInfo],
     components.append(text[(root.start_byte - start):])
     components.reverse() # We've been adding components backwards, reverse them for the correct output.
     return b"".join(components).decode("utf8")
+
+class ASTIsomorphism:
+    def __init__(self, root1: Node, root2: Node):
+        """Represents a mapping from one AST to another based on those nodes' positions within the AST.
+        
+        Precondition: The two ASTs have exactly the same structure (same node types with the same children).
+        This does not include the values of the nodes, e.g. identifier names.
+        """
+        self.root1 = root1
+        self.root2 = root2
+
+        # Maps Node IDs to the corresponding nodes.
+        mapping: dict[Node, Node] = {}
+        def recurse(node1: Node, node2: Node) -> bool:
+            mapping[node1] = node2
+            if node1.type != node2.type:
+                return False
+            return all(recurse(c1, c2) for c1, c2 in zip(node1.children, node2.children))
+        
+        if not recurse(root1, root2):
+            raise ValueError(f"Precondition violated: code snippets do not have isomorphic ASTs.")
+        self.mapping = mapping
+
+    def __getitem__(self, item: Node) -> Node:
+        return self.mapping[item]
+
+def genericize_func_and_field_names(code: str) -> tuple[list[tuple[Node, str]], Node]:
+    """Replace all function names in the provided function with the name "func"
+    and replace all field names with the name "field."
+    """
+    # When parsing a call_expression, it is important to determine whether the
+    # identifier in the call expression refers to a function name or a variable (in
+    # a call from a function pointer). This requires some analysis, which codealign 
+    # already does for us. Therefore, we use it and the AST produced by its call to 
+    # tree-sitter.
+    codealign_ir = parse(bytes(code, "utf8"))
+    assert len(codealign_ir) == 1, "Expected only one function, but found " + ", ".join(f.name for f in codealign_ir)
+    root = codealign_ir[0].node.parent
+    assert root is not None and root.type == "translation_unit"
+
+    call_instructions: dict[Node, FunctionVarOperator] = {}
+    for bb in codealign_ir[0]:
+        for ins in bb:
+            if isinstance(ins, FunctionVarOperator):
+                assert ins.ast_node is not None
+                call_instructions[ins.ast_node] = ins
+
+    edits: list[tuple[Node, str]] = []
+
+    def recurse(node: Node):
+        if node.type == "call_expression":
+            # expression.children[0]: (function) - the name of the function.
+            # expression.children[1]: (arguments; argument_list) - a list of arguments.
+            if node in call_instructions:
+                instruction = call_instructions[node]
+            else:
+                print(f"Warning: Missing call instruction for call expression in AST; may be due to dead code.")
+                return
+
+            if isinstance(instruction.name, str):
+                name_node = get_child(node, "function")
+                # The following is NOT true the other way around: You can have situations where the node is an identifer
+                # and it is not a regular function call but instead is a call based on a function poitner: hence the whole
+                # reason we're using codealign in the first place!
+                assert name_node.type == "identifier", f"Codealign determines {node.text} is a regular function but the AST node type is not an identifier."
+                assert name_node.text.decode() == instruction.name, f"Inconsistent names for function." # type: ignore
+                edits.append((name_node, GENERIC_FUNCTION_NAME))
+            else:
+                # The function could be the result of an expression which contains a field or another funciton call 
+                recurse(get_child(node, "function")) 
+            # There could be yet more function calls in the arguments.
+            recurse(get_child(node, "arguments"))
+        elif node.type == "field_expression":
+            # expression.children[0]: (argument) - an expression that resolves to the struct
+            # expression.children[1]: (operator) ->
+            # expression.children[2]: (field) - the field being accessed.
+            field_node = get_child(node, "field")
+            assert field_node.type == "field_identifier", (field_node.type, field_node.text.decode()) # type: ignore
+            edits.append((field_node, GENERIC_FIELD_NAME))
+
+            # The field itself must be an identifier, but the left node could
+            # be an arbitrarily complicated expression, so we must recurse.
+            recurse(get_child(node, "argument"))
+        else:
+            for child in node.children:
+                recurse(child)
+    
+    # populates the list "edits"
+    recurse(root)
+
+    return edits, root
+
+def get_nongeneric_function_name(instruction: SSAOperator, astmapping: ASTIsomorphism) -> str | None:
+    """If this instruction is a call instruction on a function with a name (not a function pointer),
+    return the name of that function. Otherise, return None.
+    """
+    if isinstance(instruction, FunctionSSAOperator) and isinstance(instruction.name, str):
+        assert instruction.ast_node is not None, instruction
+        node = astmapping[instruction.ast_node]
+        function_name_node = get_child(node, "function")
+        assert function_name_node.type == "identifier"
+        return function_name_node.text.decode() # type: ignore
+    return None
+
+def get_nongeneric_field_name(instruction: SSAOperator, astmapping: ASTIsomorphism) -> str | None:
+    """If this instruction is a field-access instruction, return the name of the field accessed.
+    Otherwise, return None.
+    """
+    if instruction.op == "." or instruction.op == "->":
+        assert instruction.ast_node is not None, instruction
+        node = astmapping[instruction.ast_node]
+        field_node = get_child(node, "field")
+        assert field_node.type == "field_identifier"
+        return field_node.text.decode() # type: ignore
+    return None
+
+def build_and_solve_constraints(alignment: Alignment,
+                                candidate_mapping: ASTIsomorphism,
+                                reference_mapping: ASTIsomorphism,
+                                namegetter: Callable[[SSAOperator, ASTIsomorphism], str | None],
+                                generic_name: str
+                               ) -> Iterable[tuple[dict[str, str], dict[str, str]]]:
+    """Determine if the names in the candidate and reference function are consistent (i.e. form a bijective mapping between one another.)
+    """
+
+    # Outer index: IR type (candidate, reference)
+    # Middle index: instruction in the IR. Only contains relevant instructions.
+    # Inner index: [0] SSAOperator and [1] the name that corresponds to it (either the function call name or field name)
+    instructions_by_ir: list[list[tuple[SSAOperator, str]]] = []
+
+    for i, (ir, mapping) in enumerate(zip((alignment.candidate_ir, alignment.reference_ir), (candidate_mapping, reference_mapping))):
+        relevant_instructions = []
+        for bb in ir:
+            for instruction in bb:
+                name = namegetter(instruction, mapping)
+                if name is not None:
+                    relevant_instructions.append((instruction, name))
+        instructions_by_ir.append(relevant_instructions)
+    
+    # Each variable represents a relevant instruction (either a function call or a struct-field access.)
+    variables: list[list[z3.ArithRef]] = [] # This form is more convenient for constraints within a given IR and for linking back to the original source.
+    # Note: can store both candidate and reference instructions in the same dictionary because they hash by id()
+    variable_by_instruction: dict[SSAOperator, z3.ArithRef] = {} # This form is more convenient when dealing with alignment clusters.
+    for i, instructions in enumerate(instructions_by_ir):
+        variables.append(list())
+        for j in range(len(instructions)):
+            variable = z3.Int(f"var{i}_{j}")
+            variables[i].append(variable)
+            variable_by_instruction[instructions[j][0]] = variable
+
+    constraints: list = [] # The constraints that we'll feed to z3
+    for i, instructions in enumerate(instructions_by_ir):
+        ## Constraints within a given IR
+        for j in range(len(instructions)):
+            for k in range(j + 1, len(instructions)):
+                if instructions[j][1] == instructions[k][1]:
+                    # Instructions with the same names in the non-genericized code should have the same integer value
+                    constraints.append(variables[i][j] == variables[i][k])
+                else:
+                    # Instructions with the different names in the non-genericized code should have different integer values.
+                    constraints.append(variables[i][j] != variables[i][k])
+        
+        # Instructions aligned with each other must have the same values.
+        for j, instruction in enumerate(instructions):
+            variable = variables[i][j]
+            aligned = alignment[instruction[0]]
+            assert isinstance(aligned, list), f"Expected a relational alignment."
+            # The second part of the condition is because 
+            if len(aligned) == 1:
+                constraints.append(variable == variable_by_instruction[aligned[0]])
+            elif len(aligned) > 1:
+                constraints.append(
+                    z3.Or(*(variable == variable_by_instruction[other] for other in aligned))
+                )
+
+    # Some additional constraints that are often helpful in the case of differentiating field-accesses used as lvals.
+    # Funciton calls cannot be used as lvals so this only applies to UDT field-accesses.
+    if generic_name == GENERIC_FIELD_NAME:
+        for i, ir in enumerate((alignment.candidate_ir, alignment.reference_ir)):
+            for bb in ir:
+                for ins in bb:
+                    ins: SSAOperator
+                    if ins.op == STORE_OP and ins.operands[0] in variable_by_instruction:
+                        aligned = alignment[ins]
+                        field_access_var = variable_by_instruction[ins.operands[0]] # type: ignore # We check this directly above in the if condition.
+                        assert isinstance(aligned, list), f"Expected a relational alignment."
+                        constraints.append(
+                            z3.Or(*(field_access_var == variable_by_instruction[store_op.operands[0]] for store_op in aligned)) # type: ignore # the assertion should be true based on how codealign works but mypy doesn't know that.
+                        )
+
+    clusterer = UnionFind(operator for fn in (alignment.candidate_ir, alignment.reference_ir) for block in fn.basic_blocks for operator in block if isinstance(operator, SSAOperator))
+    for left, right in alignment.alignment_list:
+        if left in variable_by_instruction and right in variable_by_instruction:
+            clusterer.union(left, right)
+    equivalence_classes: list[set[SSAOperator]] = clusterer.export_sets() # type: ignore
+    
+    opset = lambda ir: {op for bb in ir for op in bb}
+    cand_ops = opset(alignment.candidate_ir)
+    ref_ops = opset(alignment.reference_ir)
+    # For equivalence classes with exactly two elements, there's only one possible
+    # combination that satisfies the constraints, so it's not interesting to examine these further.
+    clusters: list[tuple[set[z3.ArithRef], set[z3.ArithRef]]] = [
+        ({variable_by_instruction[ins] for ins in eqc if ins in cand_ops}, 
+         {variable_by_instruction[ins] for ins in eqc if ins in ref_ops}) 
+        for eqc in equivalence_classes if len(eqc) > 2
+    ]
+    
+    def build_name_mapping(model, is_reference: bool):
+        name_mapping: dict[str, str] = {}
+        for j, v in enumerate(variables[is_reference]):
+            # Sometimes the solver may choose a negative integer value, which doesn't work well for the generic_name + str(value) pattern below, because 
+            # dashes are not valid characters for C identifiers. Instead, we map the integer values onto the natural numbers.
+            value = model[v].as_long() # type: ignore
+            value = -1 * (2 * value + 1) if value < 0 else 2 * value
+            name_mapping[instructions_by_ir[is_reference][j][1]] = generic_name + str(value)
+        return name_mapping
+    
+    def make_solution(model):
+        return (build_name_mapping(model, False), build_name_mapping(model, True))
+
+    solver = z3.Solver()
+    solver.add(constraints)
+    solver.set("timeout", 60)
+    if solver.check() == z3.sat:
+        yield make_solution(solver.model())
+
+    modelno = 0
+
+    def find_solutions(clusters: list[tuple[set[z3.ArithRef], set[z3.ArithRef]]]):
+        # There's no sense in searching ever deeper down the tree of more constrained problems if the less-constrained 
+        # root isn't satisfiable in the first place.
+        if solver.check() == z3.sat:
+            if len(clusters) == 0:
+                nonlocal modelno
+                modelno += 1
+                yield make_solution(solver.model())
+            else:
+                cand_vars, ref_vars = clusters[0]
+                remaining_clusters = clusters[1:]
+                if len(cand_vars) < len(ref_vars):
+                    cand_vars = list(cand_vars) + [None] * (len(ref_vars) - len(cand_vars))
+                elif len(ref_vars) > len(cand_vars):
+                    ref_vars = list(ref_vars) + [None] * (len(cand_vars) - len(ref_vars))
+                
+                for permutation in itertools.permutations(ref_vars, len(ref_vars)):
+                    eqs = [cand_var == ref_var for cand_var, ref_var in zip(cand_vars, permutation) if cand_var is not None and ref_var is not None]
+                    solver.push()
+                    solver.add(eqs)
+                    yield from find_solutions(remaining_clusters)
+                    solver.pop()
+    
+    yield from find_solutions(clusters)
+
+class AggregateSolverTimeoutError(Exception):
+    """A constraint-solving problem has taken too long across different invocations of the solver.
+    """
+
+def get_consistent_alignment(fn: MatchedFunction, prediction: str) -> Alignment | None:
+    """Return an alignment that is less strict that normal alignment: function names and field names need not be identical
+    to the original in order to be counted as equivalent; rather, they must simply form a bijective mapping with the names in the
+    original code.
+    """
+    # These can fail with parsing errors from codealign's parser. If they do, simply exit early and return None because that'll
+    # just happen later when we call "align."
+    prediction_edits, prediction_root = genericize_func_and_field_names(prediction)
+    original_edits, original_root = genericize_func_and_field_names(fn.canonical_original_code)
+
+    generic_prediction = edit_function(prediction_root, prediction_edits)
+    generic_original = edit_function(original_root, original_edits)
+
+    alignment: Alignment = align(generic_prediction, generic_original, 'c') # type: ignore
+
+    # May cause incomplete constraints to be generated if not prefectly aligned.
+    if not perfectly_aligned(alignment):
+        return None
+    
+    candidate_mapping = ASTIsomorphism(alignment.candidate_ir.node.parent, prediction_root) # type: ignore
+    reference_mapping = ASTIsomorphism(alignment.reference_ir.node.parent, original_root) # type: ignore
+    
+    has_functions_to_edit = any(edit[1] == GENERIC_FUNCTION_NAME for edit in original_edits)
+    has_fields_to_edit = any(edit[1] == GENERIC_FIELD_NAME for edit in original_edits)
+
+    # These mappings represent consistent canonicalizations of function names and field names, respectively.
+    # We use itertools.product below, which will iterate over nothing if there are no elements in any of the iterables in its arguments.
+    # This is problematic if there are no function or field names to align: there will be no calls to align() 
+    if has_functions_to_edit:
+        fnname_mappingss = build_and_solve_constraints(alignment, candidate_mapping, reference_mapping, get_nongeneric_function_name, GENERIC_FUNCTION_NAME)
+    else:
+        fnname_mappingss = (({}, {}),)
+    if has_fields_to_edit:
+        field_mappingss = build_and_solve_constraints(alignment, candidate_mapping, reference_mapping, get_nongeneric_field_name, GENERIC_FIELD_NAME)
+    else:
+        field_mappingss = (({}, {}),)
+    
+    start = time.time()
+    reusable_field_mappings: list[tuple[dict[str, str], dict[str, str]]] = []
+    for fnname_mappings in fnname_mappingss:
+        # The return value of build_and_solve constraints is a generator, so it can't be iterated through a second time after
+        # it is exhausted. However, we may need to iterate through it multiple times if the first function name mapping doesn't work.
+        # Therefore, we save it in a list and use that on all iterations beyond the first.
+        field_mappings_iter = field_mappingss if len(reusable_field_mappings) == 0 else reusable_field_mappings
+        for field_mappings in field_mappings_iter:
+            if time.time() - start > AGGREGATE_SOLVER_TIMEOUT:
+                raise AggregateSolverTimeoutError()
+
+            def make_consistent_function_definition(is_reference: bool, old_edits: list[tuple[Node, str]], root: Node):
+                fnname_mapping = fnname_mappings[is_reference]
+                field_mapping = field_mappings[is_reference]
+
+                edits: list[tuple[Node, str]] = []
+                for node, name in old_edits:
+                    if name == GENERIC_FUNCTION_NAME:
+                        edits.append((node, fnname_mapping[node.text.decode()])) # type: ignore
+                    else:
+                        assert name == GENERIC_FIELD_NAME
+                        edits.append((node, field_mapping[node.text.decode()])) # type: ignore
+                return edit_function(root, edits)
+
+            consistent_prediction = make_consistent_function_definition(False, prediction_edits, prediction_root)
+            consistent_original = make_consistent_function_definition(True, original_edits, original_root)
+            
+            # Any exceptions in alignment should have been encountered already.
+            alignment = align(consistent_prediction, consistent_original, 'c')
+            if perfectly_aligned(alignment):
+                return alignment
+            reusable_field_mappings.append(field_mappings)
+        # This means there are fields, but no satisfiable field mappings. Thus, there's no point in continuing to iterate
+        # in the outer function-mappings loop because both must be satisfiable for a non-None return.
+        if len(reusable_field_mappings) == 0:
+            break
+    return None
 
 ### Running exebench tests ###
 def get_function_name(definition: Node) -> str:
@@ -933,7 +1297,6 @@ def exebench_to_matched_function(example: dict[str, str]) -> MatchedFunction | N
         canonical_decompiled_code=example['hex-rays'],
         original_code=example['func_def'],
         canonical_original_code=fn.canonical_text,
-        memory_layout={},
         variable_types=fn.variable_types,
         return_type=fn.return_type,
         user_defined_types=get_all_user_defined_types(fn),

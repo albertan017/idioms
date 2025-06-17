@@ -22,7 +22,7 @@ from tree_sitter import Node, Parser, Language
 from tqdm import tqdm
 
 from idioms.data.dataset import DecompiledFunction, MatchedFunction, MatchedBinary 
-from idioms.data.function import CollectedFunction
+from idioms.data.function import CollectedFunction, MissingDebugError
 from idioms.data.types import *
 
 C_LANGUAGE = Language(tree_sitter_c.language())
@@ -31,10 +31,11 @@ parser = Parser(C_LANGUAGE)
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("decompiled_dir", help="A path the location of the decompiled function info")
-    parser.add_argument("metadata_info", help="Either a path to the decompiled binaries or a JSON file containing the relevant information.")
+    parser.add_argument("metadata_info", help="Either a path to the compiled binaries or a JSON file containing the relevant information.")
     parser.add_argument("preprocessed_dir", help="A path to the location of the original code with preprocessor run")
-    parser.add_argument("deduplication_file", help="The json file containing deduplication information")
+    parser.add_argument("deduplication_file_or_repo_list", help="The json file containing deduplication information, or a list of repos if --single-split-name is specified.")
     parser.add_argument("output_dir", help="The directory into which the dataset should be written.")
+    parser.add_argument("--single-split-name", type=str, help="Do not split into train/validation/test; instead, put all input repos in a partition of the specified name.")
     parser.add_argument("--workers", default=1, type=int, help="Number of worker processes")
     parser.add_argument("--dataset-size", default=None, type=int, help="If set, specifies the maximum number of repos in the dataset")
     parser.add_argument("--holdout-set-size", default=0.1, type=float, help="The fraction of the overall repositories that should be included in the holdout set.")
@@ -964,9 +965,12 @@ def read_decompiled(location: Path, binary: str) -> Optional[list[DecompiledFunc
         with gzip.open(location / file, "rt") as fp:
             for line in fp:
                 cf = CollectedFunction.from_json(json.loads(line))
-                examples.append(DecompiledFunction.from_cf(cf, binary=binary, max_stack_length=1024, max_type_size=1024))   
+                examples.append(DecompiledFunction.from_cf(cf, binary=binary, max_stack_length=1024, max_type_size=1024))    
     except (gzip.BadGzipFile, EOFError):
         print(f"Bad gzip file: {file}")
+        return None
+    except MissingDebugError:
+        print(f"Missing debug info in {file}")
         return None
     return examples
 
@@ -1153,7 +1157,6 @@ def build_matched_function(decompiled_fn: DecompiledFunction, original_fn: Prepr
         canonical_decompiled_code=decompiled_fn.canonical_code,
         original_code=original_fn.text,
         canonical_original_code=original_fn.canonical_text,
-        memory_layout=decompiled_fn.source,
         variable_types=original_fn.variable_types,
         return_type=original_fn.return_type,
         user_defined_types=udts,
@@ -1362,12 +1365,13 @@ def main(args: argparse.Namespace):
     decompiled_dir = Path(args.decompiled_dir)
     preprocessed_dir = Path(args.preprocessed_dir)
     metadata_info_path = Path(args.metadata_info)
-    deduplication_file = Path(args.deduplication_file)
+    repos_file = Path(args.deduplication_file_or_repo_list)
     output_dir = Path(args.output_dir)
     shard_size: int = args.shard_size
     dataset_size: Optional[int] = args.dataset_size
     valid_max_bins_per_repo = args.valid_max_bins_per_repo
     test_max_bins_per_repo = args.test_max_bins_per_repo
+    single_split_name: str | None = args.single_split_name
 
     sys.setrecursionlimit(100000) # To handle very big functions
 
@@ -1384,7 +1388,7 @@ def main(args: argparse.Namespace):
     holdout_frac: float = args.holdout_set_size
     assert holdout_frac >= 0.0 and holdout_frac < 0.33, f"Holdout set size invalid: {holdout_frac} (must be in [0, 0.33))."
     assert shard_size > 0, f"Invalid shard size: {shard_size} (should be > 0)."
-    assert deduplication_file.exists(), f"Deduplication file {deduplication_file} does not exist."
+    assert repos_file.exists(), f"Deduplication file {repos_file} does not exist."
 
     # Find out for which binaries we have IDA-generated data
     # The original file name, which is the original hash of the binary is at [1]. For smaller binaries, this is the same,
@@ -1413,17 +1417,24 @@ def main(args: argparse.Namespace):
     print(f"{len(repometa)} of theses repos exist at {preprocessed_dir}")
 
     # Filter out repositories that have no C files, and further deduplicate repositories
-    with open(deduplication_file, "r") as fp:
-        dedup_info = json.load(fp)
-    raw_duplicate_clusters: list[list[str]] = dedup_info["clusters"]
-    no_c: set[str] = set(dedup_info["uncomputible"])
+    if single_split_name is None:
+        with open(repos_file, "r") as fp:
+            dedup_info = json.load(fp)
+        raw_duplicate_clusters: list[list[str]] = dedup_info["clusters"]
+        no_c: set[str] = set(dedup_info["uncomputible"])
 
-    repometa = {
-        repo: meta for repo, meta in repometa.items()
-        if repo not in no_c
-    }
+        repometa = {
+            repo: meta for repo, meta in repometa.items()
+            if repo not in no_c
+        }
 
-    print(f"{len(repometa)} of these repos have C code.")
+        print(f"{len(repometa)} of these repos have C code.")
+    else:
+        # the --single-split-name option assumes manual/prior deduplication
+        with open(repos_file, "r") as fp:
+            raw_duplicate_clusters = [[repo.strip()] for repo in fp.readlines()]
+        assert all(len(c[0].split("/")) == 2 for c in raw_duplicate_clusters), f"In --single-split-name mode, expected one repo per line as the deduplication_file_or_repo_list argument."
+        print(f"Read {len(raw_duplicate_clusters)} total repos")
 
     # Clusters may contain repositories that we weren't able to get preprocessed files for. Filter these out.
     duplicate_clusters = []
@@ -1440,12 +1451,13 @@ def main(args: argparse.Namespace):
     random.shuffle(duplicate_clusters)
     if dataset_size is not None:
         duplicate_clusters = duplicate_clusters[:dataset_size]
-    for cluster in duplicate_clusters:
-        random.shuffle(cluster)
-    holdout_size = int(holdout_frac * len(duplicate_clusters))
-    testing_clusters = duplicate_clusters[:holdout_size]
-    validation_clusters = duplicate_clusters[holdout_size:2*holdout_size]
-    training_clusters = duplicate_clusters[2*holdout_size:]
+    if single_split_name is None:
+        for cluster in duplicate_clusters:
+            random.shuffle(cluster)
+        holdout_size = int(holdout_frac * len(duplicate_clusters))
+        testing_clusters = duplicate_clusters[:holdout_size]
+        validation_clusters = duplicate_clusters[holdout_size:2*holdout_size]
+        training_clusters = duplicate_clusters[2*holdout_size:]
 
     def repository_binaries(clusters: list[list[str]]) -> Iterator[tuple[str, set[str]]]:
         for cluster in clusters:
@@ -1496,29 +1508,33 @@ def main(args: argparse.Namespace):
             
             write_shard(output_dir / f"{partition_name}-{shard_no}.tar", output_buffer)
             return partition_bins
-    
-    testing_bins = build_and_write_partition(testing_clusters, "test", test_max_bins_per_repo)
-    validation_bins = build_and_write_partition(validation_clusters, "validation", valid_max_bins_per_repo)
-    training_bins = build_and_write_partition(training_clusters, "train")
-
-    make_bin_set = lambda bins: {b for repobins in bins.values() for b in repobins}
-    flattened_test_bins = make_bin_set(testing_bins)
-    flattened_validation_bins = make_bin_set(validation_bins)
-    flattened_training_bins = make_bin_set(training_bins)
-
-    print(f"Sizes of each set (# binaries): test: {len(flattened_test_bins)}, validation: {len(flattened_validation_bins)}, train: {len(flattened_training_bins)}")
-    print(f"Test-train binary overlap {len(flattened_test_bins.intersection(flattened_training_bins))}")
-    print(f"Validation-train overlap: {len(flattened_validation_bins.intersection(flattened_training_bins))}")
-    print(f"Test-validation binary overlap: {len(flattened_test_bins.intersection(flattened_validation_bins))}")
-
+        
     def write_repos(filename: Path, repos: Iterable[str]):
         with open(filename, "w") as fp:
             fp.write("\n".join(repos))
             fp.write("\n")
     
-    write_repos(output_dir / "test_repos.txt", testing_bins) # keys of the dictionary are the repos
-    write_repos(output_dir / "validation_repos.txt", validation_bins)
-    write_repos(output_dir / "train_repos.txt", training_bins)
+    if single_split_name is None:
+        testing_bins = build_and_write_partition(testing_clusters, "test", test_max_bins_per_repo)
+        validation_bins = build_and_write_partition(validation_clusters, "validation", valid_max_bins_per_repo)
+        training_bins = build_and_write_partition(training_clusters, "train")
+
+        make_bin_set = lambda bins: {b for repobins in bins.values() for b in repobins}
+        flattened_test_bins = make_bin_set(testing_bins)
+        flattened_validation_bins = make_bin_set(validation_bins)
+        flattened_training_bins = make_bin_set(training_bins)
+
+        print(f"Sizes of each set (# binaries): test: {len(flattened_test_bins)}, validation: {len(flattened_validation_bins)}, train: {len(flattened_training_bins)}")
+        print(f"Test-train binary overlap {len(flattened_test_bins.intersection(flattened_training_bins))}")
+        print(f"Validation-train overlap: {len(flattened_validation_bins.intersection(flattened_training_bins))}")
+        print(f"Test-validation binary overlap: {len(flattened_test_bins.intersection(flattened_validation_bins))}")
+
+        write_repos(output_dir / "test_repos.txt", testing_bins) # keys of the dictionary are the repos
+        write_repos(output_dir / "validation_repos.txt", validation_bins)
+        write_repos(output_dir / "train_repos.txt", training_bins)
+    else:
+        split_bins = build_and_write_partition(duplicate_clusters, single_split_name)
+        write_repos(output_dir / f"{single_split_name}_repos.txt", split_bins)
 
     with open(output_dir / "command.txt", "w") as fp:
         fp.write(" ".join(sys.argv))

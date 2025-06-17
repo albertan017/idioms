@@ -11,11 +11,11 @@ from typing import DefaultDict, Mapping, Optional, Set, Tuple
 # Huge hack to get importing to work with the decompiler
 try:
     from idioms.data.ida_ast import AST
-    from idioms.data.types import TypeLibCodec, TypeInfo
+    from idioms.data.types import TypeLibCodec, TypeInfo, PlaceholderType
     from idioms.data.variable import Location, Stack, Variable, location_from_json_key
 except ImportError:
     from .ida_ast import AST
-    from .types import TypeLibCodec, TypeInfo
+    from .types import TypeLibCodec, TypeInfo, PlaceholderType
     from .variable import Location, Stack, Variable, location_from_json_key
 
 
@@ -65,7 +65,10 @@ class Function:
     @classmethod
     def from_json(cls, d):
         ast = AST.from_json(d["t"]) if d["t"] else None
-        return_type = TypeLibCodec.decode(dumps(d["r"]))
+        try:
+            return_type = TypeLibCodec.decode(dumps(d["r"]))
+        except:
+            return_type = PlaceholderType()
         arguments = dict()
         for key, args in d["a"].items():
             arguments[location_from_json_key(key)] = \
@@ -160,6 +163,10 @@ class Function:
         return ret
 
 
+class MissingDebugError(Exception):
+    """Thrown when debug information is missing from the binary.
+    """
+
 class CollectedFunction:
     """Collected information about a single function. Has both debug and
     decompiler-generated data.
@@ -180,6 +187,8 @@ class CollectedFunction:
 
     @classmethod
     def from_json(cls, d):
+        if d["b"] is None:
+            raise MissingDebugError()
         debug = Function.from_json(d["b"])
         decompiler = Function.from_json(d["c"])
         return cls(ea=d["e"], debug=debug, decompiler=decompiler)
